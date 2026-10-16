@@ -1,4 +1,4 @@
-# waitress_static
+# waitress_webserver
 
 A tiny, production-grade replacement for `python -m http.server`, powered by
 [Waitress](https://docs.pylonsproject.org/projects/waitress/) - a pure-Python,
