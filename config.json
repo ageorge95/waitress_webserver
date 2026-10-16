@@ -2,6 +2,8 @@
     "host": "0.0.0.0",
     "port": 1122,
     "threads": 8,
+    "upload_token": "public",
+    "max_upload_gb": 10,
     "folders": [
         "D:\\shared",
         "E:\\shared"

@@ -1,17 +1,24 @@
 import json
 import logging
 import os
+import shutil
 import sys
+import tempfile
 from waitress import serve
 from static_wsgi_app import StaticFileWSGIApp
+from upload_wsgi_app import UPLOAD_PATH, UploadWSGIMiddleware
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+# Uploaded archives are staged here before being moved to a served folder.
+UPLOAD_TMP_DIR = os.path.join(SCRIPT_DIR, "upload_tmp")
 
 # Used when the corresponding key is absent from config.json.
 DEFAULT_PORT = 1122
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_THREADS = 8
+DEFAULT_UPLOAD_TOKEN = "public"
+DEFAULT_MAX_UPLOAD_GB = 10
 
 class ConfigError(Exception):
     pass
@@ -50,6 +57,14 @@ def load_config(path=CONFIG_PATH):
     if isinstance(threads, bool) or not isinstance(threads, int) or threads < 1:
         raise ConfigError("'threads' must be a positive integer")
 
+    upload_token = raw.get("upload_token", DEFAULT_UPLOAD_TOKEN)
+    if not isinstance(upload_token, str):
+        raise ConfigError("'upload_token' must be a string (empty string disables uploads)")
+
+    max_upload_gb = raw.get("max_upload_gb", DEFAULT_MAX_UPLOAD_GB)
+    if isinstance(max_upload_gb, bool) or not isinstance(max_upload_gb, (int, float)) or max_upload_gb <= 0:
+        raise ConfigError("'max_upload_gb' must be a positive number")
+
     # Relative folder paths are resolved against the repo root (not the
     # current working directory) so behaviour doesn't depend on where the
     # server is launched from. Duplicates are dropped, keeping the first.
@@ -63,7 +78,9 @@ def load_config(path=CONFIG_PATH):
             seen.add(key)
             resolved.append(full)
 
-    return {"folders": resolved, "port": port, "host": host, "threads": threads}
+    return {"folders": resolved, "port": port, "host": host, "threads": threads,
+            "upload_token": upload_token.strip(),
+            "max_upload_bytes": int(max_upload_gb * 1024 ** 3)}
 
 def main():
     logging.basicConfig(
@@ -88,7 +105,20 @@ def main():
     if len(missing) == len(folders):
         log.warning("None of the configured folders currently exist - every request will return 404")
 
-    application = StaticFileWSGIApp(folders)
+    # Waitress buffers large request bodies in temp files before the app
+    # sees them; keep those next to the server (not in %TEMP%) as well.
+    # Leftovers from a previous crash are cleared on startup.
+    shutil.rmtree(UPLOAD_TMP_DIR, ignore_errors=True)
+    os.makedirs(UPLOAD_TMP_DIR, exist_ok=True)
+    tempfile.tempdir = UPLOAD_TMP_DIR
+
+    application = UploadWSGIMiddleware(
+        StaticFileWSGIApp(folders),
+        folders,
+        token=config["upload_token"],
+        tmp_dir=UPLOAD_TMP_DIR,
+        max_bytes=config["max_upload_bytes"],
+    )
 
     print("=" * 60)
     print("Waitress static file server starting")
@@ -98,9 +128,15 @@ def main():
         print(f"    {i}. [{status}] {folder}")
     print(f"  Listening on      : http://{config['host']}:{config['port']}")
     print(f"  Worker threads    : {config['threads']}")
+    if config["upload_token"]:
+        print(f"  Upload page       : http://{config['host']}:{config['port']}{UPLOAD_PATH}")
+        print(f"  Max upload size   : {config['max_upload_bytes'] / 1024 ** 3:g} GB")
+    else:
+        print("  Uploads           : disabled (empty upload_token)")
     print("=" * 60)
 
-    serve(application, host=config["host"], port=config["port"], threads=config["threads"])
+    serve(application, host=config["host"], port=config["port"], threads=config["threads"],
+          max_request_body_size=config["max_upload_bytes"])
 
 if __name__ == "__main__":
     main()
