@@ -1,4 +1,4 @@
-import argparse
+import json
 import logging
 import os
 import sys
@@ -6,85 +6,101 @@ from waitress import serve
 from static_wsgi_app import StaticFileWSGIApp
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_DIRECTORY = os.path.join(SCRIPT_DIR, "www")
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+
+# Used when the corresponding key is absent from config.json.
 DEFAULT_PORT = 1122
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_THREADS = 8
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Serve a directory of static files using Waitress - a "
-            "production-quality, multi-threaded WSGI server. Drop-in "
-            "replacement for 'python -m http.server' that can comfortably "
-            "handle several colleagues browsing/downloading at once."
-        )
-    )
-    parser.add_argument(
-        "port",
-        nargs="?",
-        type=int,
-        default=DEFAULT_PORT,
-        help=f"Port to listen on (default: {DEFAULT_PORT})",
-    )
-    parser.add_argument(
-        "-d", "--directory",
-        default=None,
-        help=(
-            "Directory to serve (default: the 'www' folder next to "
-            "server.py, created automatically on first run)"
-        ),
-    )
-    parser.add_argument(
-        "-b", "--bind",
-        dest="host",
-        default=DEFAULT_HOST,
-        help=f"Host/interface to bind to (default: {DEFAULT_HOST})",
-    )
-    parser.add_argument(
-        "-t", "--threads",
-        type=int,
-        default=DEFAULT_THREADS,
-        help=f"Number of Waitress worker threads (default: {DEFAULT_THREADS})",
-    )
-    return parser.parse_args()
+class ConfigError(Exception):
+    pass
 
-def resolve_serve_directory(args):
-    if args.directory is None:
-        serve_dir = DEFAULT_DIRECTORY
-        if not os.path.isdir(serve_dir):
-            os.makedirs(serve_dir, exist_ok=True)
-            print(f"Created default content directory: {serve_dir}")
-    else:
-        serve_dir = os.path.abspath(args.directory)
+def load_config(path=CONFIG_PATH):
+    """Load and validate config.json. Raises ConfigError on any problem."""
+    if not os.path.isfile(path):
+        raise ConfigError(f"configuration file not found: {path}")
 
-    if not os.path.isdir(serve_dir):
-        print(f"ERROR: directory not found: {serve_dir}", file=sys.stderr)
-        sys.exit(1)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"invalid JSON in {path}: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"cannot read {path}: {exc}") from exc
 
-    return serve_dir
+    if not isinstance(raw, dict):
+        raise ConfigError("the top level of config.json must be a JSON object")
+
+    folders = raw.get("folders")
+    if not isinstance(folders, list) or not folders:
+        raise ConfigError("'folders' must be a non-empty list of folder paths")
+    if not all(isinstance(f, str) and f.strip() for f in folders):
+        raise ConfigError("every entry in 'folders' must be a non-empty string")
+
+    port = raw.get("port", DEFAULT_PORT)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ConfigError("'port' must be an integer between 1 and 65535")
+
+    host = raw.get("host", DEFAULT_HOST)
+    if not isinstance(host, str) or not host.strip():
+        raise ConfigError("'host' must be a non-empty string")
+
+    threads = raw.get("threads", DEFAULT_THREADS)
+    if isinstance(threads, bool) or not isinstance(threads, int) or threads < 1:
+        raise ConfigError("'threads' must be a positive integer")
+
+    # Relative folder paths are resolved against the repo root (not the
+    # current working directory) so behaviour doesn't depend on where the
+    # server is launched from. Duplicates are dropped, keeping the first.
+    resolved = []
+    seen = set()
+    for folder in folders:
+        expanded = os.path.expandvars(os.path.expanduser(folder.strip()))
+        full = os.path.abspath(os.path.join(SCRIPT_DIR, expanded))
+        key = os.path.normcase(full)
+        if key not in seen:
+            seen.add(key)
+            resolved.append(full)
+
+    return {"folders": resolved, "port": port, "host": host, "threads": threads}
 
 def main():
-    args = parse_args()
-
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         stream=sys.stdout
     )
     logging.getLogger('waitress').setLevel(logging.INFO)
+    log = logging.getLogger("server")
 
-    serve_dir = resolve_serve_directory(args)
-    application = StaticFileWSGIApp(serve_dir)
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        print("See README.md for the expected config.json format.", file=sys.stderr)
+        sys.exit(1)
+
+    folders = config["folders"]
+    missing = [f for f in folders if not os.path.isdir(f)]
+    for folder in missing:
+        log.warning("Configured folder not found (skipped until it becomes available): %s", folder)
+    if len(missing) == len(folders):
+        log.warning("None of the configured folders currently exist - every request will return 404")
+
+    application = StaticFileWSGIApp(folders)
 
     print("=" * 60)
     print("Waitress static file server starting")
-    print(f"  Serving directory : {serve_dir}")
-    print(f"  Listening on      : http://{args.host}:{args.port}")
-    print(f"  Worker threads    : {args.threads}")
+    print("  Serving folders (first match wins):")
+    for i, folder in enumerate(folders, 1):
+        status = "MISSING" if folder in missing else "ok"
+        print(f"    {i}. [{status}] {folder}")
+    print(f"  Listening on      : http://{config['host']}:{config['port']}")
+    print(f"  Worker threads    : {config['threads']}")
     print("=" * 60)
 
-    serve(application, host=args.host, port=args.port, threads=args.threads)
+    serve(application, host=config["host"], port=config["port"], threads=config["threads"])
 
 if __name__ == "__main__":
     main()

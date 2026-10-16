@@ -2,15 +2,21 @@
 A minimal, dependency-free WSGI application that reproduces the behaviour of
 Python's built-in ``python -m http.server``:
 
-    * Serves static files from a root directory.
+    * Serves static files from one or more root directories, merged into a
+      single virtual root (e.g. several HDDs exposed as one tree). When the
+      same relative path exists in more than one root, the root listed
+      first wins. Sub-directories with the same name are merged recursively.
     * Generates an HTML directory listing when no ``index.html`` /
-      ``index.htm`` is present (sorted alphabetically, case-insensitive).
+      ``index.htm`` is present (sorted alphabetically, case-insensitive),
+      combining the entries of every root that contains that directory.
     * Guesses the correct ``Content-Type`` for every file.
     * Redirects "directory" URLs that are missing a trailing slash.
     * Supports GET / HEAD and single-range ``Range`` requests (useful for
       resuming downloads or seeking within media files).
-    * Blocks any attempt to escape the served root directory
+    * Blocks any attempt to escape the served root directories
       (directory-traversal protection).
+    * Roots are looked up on every request, so a drive that is offline at
+      startup is picked up automatically once it becomes available.
 
 It only depends on the Python standard library, so the only extra
 requirement to actually expose it to the network is ``waitress`` itself.
@@ -29,13 +35,21 @@ mimetypes.init()
 mimetypes.add_type("application/octet-stream", "")
 
 class StaticFileWSGIApp:
-    """A tiny static file server exposed as a WSGI callable."""
+    """A tiny static file server exposed as a WSGI callable.
+
+    ``root_dirs`` is an ordered list of directories that are merged into a
+    single virtual root. Earlier entries take priority over later ones.
+    """
 
     index_files = ("index.html", "index.htm")
     chunk_size = 64 * 1024
 
-    def __init__(self, root_dir="."):
-        self.root_dir = os.path.abspath(root_dir)
+    def __init__(self, root_dirs):
+        if isinstance(root_dirs, (str, os.PathLike)):
+            root_dirs = [root_dirs]
+        self.root_dirs = [os.path.abspath(d) for d in root_dirs]
+        if not self.root_dirs:
+            raise ValueError("At least one root directory is required")
 
     # ------------------------------------------------------------------ #
     # WSGI entry point
@@ -47,19 +61,25 @@ class StaticFileWSGIApp:
                                 [("Allow", "GET, HEAD")])
 
         try:
-            path = self._resolve_path(environ.get("PATH_INFO", "/"))
+            matches = self._resolve_path(environ.get("PATH_INFO", "/"))
         except PermissionError:
             return self._error(start_response, "403 Forbidden")
 
-        if path is None:
+        if not matches:
             return self._error(start_response, "404 Not Found")
 
-        if os.path.isdir(path):
-            index = self._find_index(path)
+        # The first root containing the path decides whether it is a file
+        # or a directory; same-named entries of the other kind in lower
+        # priority roots are shadowed.
+        if os.path.isdir(matches[0]):
+            dir_paths = [m for m in matches if os.path.isdir(m)]
+            index = self._find_index(dir_paths)
             if index:
                 path = index
             else:
-                return self._serve_directory_listing(environ, start_response, path)
+                return self._serve_directory_listing(environ, start_response, dir_paths)
+        else:
+            path = matches[0]
 
         if not os.path.isfile(path):
             return self._error(start_response, "404 Not Found")
@@ -69,7 +89,17 @@ class StaticFileWSGIApp:
     # ------------------------------------------------------------------ #
     # Path resolution / security
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _is_inside(root, full_path):
+        root_cmp = os.path.normcase(root)
+        path_cmp = os.path.normcase(full_path)
+        # os.path.join(root, "") guarantees exactly one trailing separator,
+        # which also works for drive roots such as "D:\".
+        return path_cmp == root_cmp or path_cmp.startswith(os.path.join(root_cmp, ""))
+
     def _resolve_path(self, path_info):
+        """Return every existing filesystem path matching ``path_info``,
+        ordered by root priority (empty list if nothing matches)."""
         path_info = urllib.parse.unquote(path_info)
         # PATH_INFO always starts with '/' per the WSGI spec.
         relative_path = path_info.lstrip("/")
@@ -77,26 +107,28 @@ class StaticFileWSGIApp:
         if normalized in (".", ""):
             normalized = ""
 
-        full_path = os.path.abspath(os.path.join(self.root_dir, normalized))
-        if full_path != self.root_dir and not full_path.startswith(self.root_dir + os.sep):
-            # Someone tried to escape the served directory with e.g. '../..'
-            raise PermissionError("Path traversal attempt blocked")
+        matches = []
+        for root in self.root_dirs:
+            full_path = os.path.abspath(os.path.join(root, normalized))
+            if not self._is_inside(root, full_path):
+                # Someone tried to escape the served directory with e.g. '../..'
+                raise PermissionError("Path traversal attempt blocked")
+            if os.path.exists(full_path):
+                matches.append(full_path)
+        return matches
 
-        if not os.path.exists(full_path):
-            return None
-        return full_path
-
-    def _find_index(self, dir_path):
+    def _find_index(self, dir_paths):
         for name in self.index_files:
-            candidate = os.path.join(dir_path, name)
-            if os.path.isfile(candidate):
-                return candidate
+            for dir_path in dir_paths:
+                candidate = os.path.join(dir_path, name)
+                if os.path.isfile(candidate):
+                    return candidate
         return None
 
     # ------------------------------------------------------------------ #
     # Directory listing
     # ------------------------------------------------------------------ #
-    def _serve_directory_listing(self, environ, start_response, dir_path):
+    def _serve_directory_listing(self, environ, start_response, dir_paths):
         request_path = environ.get("PATH_INFO", "/")
         if not request_path.endswith("/"):
             location = request_path + "/"
@@ -106,21 +138,34 @@ class StaticFileWSGIApp:
             start_response("301 Moved Permanently", [("Location", location), ("Content-Length", "0")])
             return [b""]
 
-        try:
-            entries = sorted(os.listdir(dir_path), key=str.lower)
-        except OSError:
+        # Merge the entries of every root, first root wins on duplicates
+        # (compared with normcase, i.e. case-insensitively on Windows).
+        merged = {}
+        readable = False
+        for dir_path in dir_paths:
+            try:
+                names = os.listdir(dir_path)
+            except OSError:
+                continue
+            readable = True
+            for name in names:
+                key = os.path.normcase(name)
+                if key not in merged:
+                    merged[key] = (name, os.path.isdir(os.path.join(dir_path, name)))
+        if not readable:
             return self._error(start_response, "403 Forbidden")
+
+        entries = sorted(merged.values(), key=lambda e: e[0].lower())
 
         display_path = html.escape(urllib.parse.unquote(request_path))
         rows = []
         if request_path != "/":
             rows.append('<li><a href="../">../</a></li>')
 
-        for name in entries:
-            full_entry = os.path.join(dir_path, name)
+        for name, is_dir in entries:
             display_name = name
             link_name = urllib.parse.quote(name)
-            if os.path.isdir(full_entry):
+            if is_dir:
                 display_name += "/"
                 link_name += "/"
             rows.append(f'<li><a href="{link_name}">{html.escape(display_name)}</a></li>')

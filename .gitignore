@@ -2,6 +2,3 @@
 *.pyc
 /venv
 activate.bat
-/www/*
-!/www/.gitkeep
-
