@@ -3,3 +3,5 @@
 /venv
 activate.bat
 /upload_tmp
+/activate.ps1
+/activate.sh

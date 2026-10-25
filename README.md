@@ -109,18 +109,18 @@ Behaviour:
 
 ## Installation
 
-Run `Install.bat` once. It will:
+Run `powershell -ExecutionPolicy Bypass -File _install\install.ps1` once. It will:
 
 1. Create a local virtual environment in `venv/`
-2. Verify your Python version is compatible (Python 3.7+)
-3. Install the dependencies from `requirements.txt` (just `waitress`)
+2. Skip incompatible Python versions and pick the highest compatible one
+3. Install the dependencies from `requirements.txt` (just `waitress`) with `uv`
+4. Set up `activate.bat` / `activate.ps1`
 
-```bat
-Install.bat
+```powershell
+powershell -ExecutionPolicy Bypass -File _install\install.ps1
 ```
 
-Optionally pass a specific python executable/launcher as the first argument,
-e.g. `Install.bat py`.
+You can also pass a specific Python interpreter with `-Python <path>`.
 
 ## Starting the server
 
